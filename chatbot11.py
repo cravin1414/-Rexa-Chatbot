@@ -12,11 +12,182 @@ from typing import Optional
 import sounddevice as sd
 import numpy as np
 import wave
-from transformers import pipeline
-from io import BytesIO
 import time
 import speech_recognition as sr
+import pyttsx3
+import threading
 import tempfile
+import queue
+
+# Global TTS variables
+tts_engine = None
+tts_lock = threading.Lock()
+
+def initialize_tts():
+    """Initialize text-to-speech engine"""
+    global tts_engine
+    if tts_engine is None:
+        try:
+            tts_engine = pyttsx3.init()
+            # Configure voice settings
+            voices = tts_engine.getProperty('voices')
+            if voices:
+                # Try to set a female voice or use the first available
+                for voice in voices:
+                    if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
+                        tts_engine.setProperty('voice', voice.id)
+                        break
+                else:
+                    tts_engine.setProperty('voice', voices[0].id)
+            
+            # Set speech rate and volume
+            tts_engine.setProperty('rate', 180)  # Speed of speech
+            tts_engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
+            return True
+        except Exception as e:
+            st.error(f"Failed to initialize TTS engine: {str(e)}")
+            return False
+    return True
+
+def speak_text(text):
+    """Convert text to speech using pyttsx3"""
+    global tts_engine, tts_lock
+    
+    if not text or not text.strip():
+        return
+    
+    with tts_lock:
+        try:
+            if tts_engine is None:
+                if not initialize_tts():
+                    return
+            
+            # Clean text for better speech
+            clean_text = text.replace('*', '').replace('#', '').replace('`', '')
+            clean_text = clean_text.replace('**', '').replace('###', '')
+            
+            # Speak the text
+            tts_engine.say(clean_text)
+            tts_engine.runAndWait()
+            
+        except Exception as e:
+            st.error(f"Error in text-to-speech: {str(e)}")
+
+def reset_tts_engine():
+    """Reset the TTS engine"""
+    global tts_engine
+    with tts_lock:
+        if tts_engine:
+            try:
+                tts_engine.stop()
+            except:
+                pass
+        tts_engine = None
+    st.session_state.tts_initialized = False
+
+def stop_tts_engine():
+    """Stop the TTS engine"""
+    global tts_engine
+    with tts_lock:
+        if tts_engine:
+            try:
+                tts_engine.stop()
+            except:
+                pass
+
+class ContinuousTranscriber:
+    """Continuous speech recognition transcriber"""
+    
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.microphone = None
+        self.is_listening = False
+        self.transcription_queue = queue.Queue()
+        self.audio_queue = queue.Queue()
+        
+        # Configure recognizer for better performance
+        self.recognizer.energy_threshold = 4000
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 1.0
+        self.recognizer.phrase_threshold = 0.3
+        self.recognizer.non_speaking_duration = 1.0
+        
+        # Initialize microphone
+        self.setup_microphone()
+    
+    def setup_microphone(self):
+        """Setup microphone with optimal settings"""
+        try:
+            self.microphone = sr.Microphone(sample_rate=16000, chunk_size=1024)
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            return True
+        except Exception as e:
+            st.error(f"Failed to setup microphone: {str(e)}")
+            return False
+    
+    def listen_continuously(self):
+        """Continuously listen for speech"""
+        if not self.microphone:
+            return
+        
+        def callback(recognizer, audio):
+            """Callback function for continuous listening"""
+            try:
+                self.audio_queue.put(audio)
+            except Exception as e:
+                print(f"Error in callback: {str(e)}")
+        
+        # Start listening in background
+        self.stop_listening = self.recognizer.listen_in_background(
+            self.microphone, callback, phrase_time_limit=5
+        )
+        self.is_listening = True
+    
+    def process_audio_queue(self):
+        """Process audio from queue and transcribe"""
+        transcriptions = []
+        
+        while not self.audio_queue.empty():
+            try:
+                audio = self.audio_queue.get_nowait()
+                
+                # Try Google Speech Recognition first
+                try:
+                    text = self.recognizer.recognize_google(audio, language='en-US')
+                    if text and text.strip():
+                        transcriptions.append(text.strip())
+                except sr.UnknownValueError:
+                    continue
+                except sr.RequestError:
+                    # Fallback to offline recognition
+                    try:
+                        text = self.recognizer.recognize_sphinx(audio)
+                        if text and text.strip():
+                            transcriptions.append(text.strip())
+                    except:
+                        continue
+                        
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"Error processing audio: {str(e)}")
+                continue
+        
+        return transcriptions
+    
+    def get_transcription(self):
+        """Get latest transcription"""
+        transcriptions = self.process_audio_queue()
+        if transcriptions:
+            return transcriptions[-1]  # Return the most recent transcription
+        return None
+    
+    def stop_listening_continuous(self):
+        """Stop continuous listening"""
+        if hasattr(self, 'stop_listening') and self.stop_listening:
+            self.stop_listening(wait_for_stop=False)
+            self.is_listening = False
 
 def initialize_session_state():
     """Initialize session state variables"""
@@ -48,12 +219,16 @@ def initialize_session_state():
         st.session_state.audio_data = None
     if "voice_assistant_enabled" not in st.session_state:
         st.session_state.voice_assistant_enabled = False
-    if "speech_to_text_model" not in st.session_state:
-        st.session_state.speech_to_text_model = None
-    if "text_to_speech_model" not in st.session_state:
-        st.session_state.text_to_speech_model = None
     if "speech_recognizer" not in st.session_state:
         st.session_state.speech_recognizer = None
+    if "transcriber" not in st.session_state:
+        st.session_state.transcriber = None
+    if "listening_active" not in st.session_state:
+        st.session_state.listening_active = False
+    if "tts_initialized" not in st.session_state:
+        st.session_state.tts_initialized = False
+    if "voice_mode" not in st.session_state:
+        st.session_state.voice_mode = False
 
 def get_available_models():
     """Get available Ollama models"""
@@ -332,38 +507,6 @@ def speech_to_text(audio_file):
     """Convert speech to text using Google Speech Recognition (enhanced version)"""
     return speech_to_text_google(audio_file)
 
-def text_to_speech(text):
-    """Convert text to speech using Hugging Face model"""
-    if st.session_state.text_to_speech_model is None:
-        try:
-            st.session_state.text_to_speech_model = pipeline(
-                "text-to-speech", 
-                model="facebook/fastspeech2-en-ljspeech"
-            )
-        except Exception as e:
-            st.error(f"Failed to load text-to-speech model: {str(e)}")
-            return None, None
-    
-    with st.spinner("🔊 Generating speech..."):
-        try:
-            audio = st.session_state.text_to_speech_model(text)
-            # Convert to numpy array and normalize
-            audio_array = np.array(audio["audio"])
-            audio_array = audio_array / np.max(np.abs(audio_array))
-            return audio_array, audio["sampling_rate"]
-        except Exception as e:
-            st.error(f"Error in speech generation: {str(e)}")
-            return None, None
-
-def play_audio(audio_array, sample_rate):
-    """Play audio using sounddevice"""
-    if audio_array is not None and sample_rate is not None:
-        try:
-            sd.play(audio_array, samplerate=sample_rate)
-            sd.wait()
-        except Exception as e:
-            st.error(f"Error playing audio: {str(e)}")
-
 def voice_assistant_ui():
     """Voice assistant UI components"""
     with st.expander("🎙️ Voice Assistant", expanded=True):
@@ -418,8 +561,7 @@ def voice_assistant_ui():
                                     
                                     # Convert response to speech
                                     if st.session_state.voice_assistant_enabled and full_response:
-                                        audio_array, sample_rate = text_to_speech(full_response)
-                                        play_audio(audio_array, sample_rate)
+                                        speak_text(full_response)
                                 
                                 st.session_state.generating = False
                                 st.session_state.response_complete = True
@@ -442,6 +584,11 @@ def voice_assistant_ui():
             )
             if voice_enabled != st.session_state.voice_assistant_enabled:
                 st.session_state.voice_assistant_enabled = voice_enabled
+                # Initialize TTS when voice is enabled
+                if voice_enabled and not st.session_state.tts_initialized:
+                    if initialize_tts():
+                        st.session_state.tts_initialized = True
+                        st.success("✅ Text-to-Speech initialized!")
                 st.rerun()
 
 def main():
@@ -649,6 +796,18 @@ def main():
         with col2:
             st.button("⏹️ Stop", on_click=stop_generation)
         
+        # Voice Control Section
+        st.divider()
+        st.subheader("🎙️ Voice Control")
+        
+        if st.button("🔄 Reset Voice Engine"):
+            reset_tts_engine()
+            st.success("Voice engine reset successfully!")
+        
+        if st.button("⏹️ Stop Speaking"):
+            stop_tts_engine()
+            st.success("Speech stopped!")
+        
         st.markdown("---")
         st.markdown("💡 **Tips:**")
         st.markdown("• Press Shift+Enter to send messages")
@@ -741,9 +900,8 @@ def main():
                     )
                 
                 # Convert response to speech if voice assistant is enabled
-                if st.session_state.voice_assistant_enabled:
-                    audio_array, sample_rate = text_to_speech(full_response)
-                    play_audio(audio_array, sample_rate)
+                if st.session_state.voice_assistant_enabled and full_response:
+                    speak_text(full_response)
             
             ai_message = AIMessage(content=full_response)
             st.session_state.messages.append(ai_message)
